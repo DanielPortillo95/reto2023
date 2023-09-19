@@ -1,0 +1,192 @@
+name: '$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)'
+trigger:
+  branches:
+    include:
+      - master
+resources:
+  - repo: self
+variables:
+  vmImageName: ubuntu-20.04
+  npm_config_cache: $(Pipeline.Workspace)/.npm
+  PORT: 8888
+  KUBECTL_VERSION: 1.19.0
+  PROFILE_DEV: dev
+  NAMESPACE: default
+  GCP_REGISTRY_DEV: GCP-REGISTRY-FP-DEV-ME-TI
+  GCP_PROJECT_DEV: fp-dev-me-ti-project
+  GCP_GKE_DEV: GCP-GKE-FP-DEV-ME-TI
+stages:
+  - stage: compileAndScan
+    displayName: compileAndScan
+    jobs:
+      - job: compileJob
+        displayName: compileJob
+        continueOnError: false
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - bash: |
+              ccommit="$(Build.SourceVersion)"
+              echo "##vso[task.setvariable variable=tag]${ccommit:0:8}"
+            displayName: createTag
+            name: createTag
+          - bash: |
+              #fullbranch=$(Build.SourceBranch)
+              #echo "##vso[task.setvariable variable=branch]${fullbranch:11}"
+            displayName: readBranch
+            name: readBranch
+          - task: Cache@2
+            inputs:
+              key: 'npm | "$(Agent.OS)" | package-lock.json'
+              restoreKeys: |
+                npm | "$(Agent.OS)"
+              path: $(npm_config_cache)
+            displayName: Cache npm
+          - task: Npm@1
+            displayName: npmInstall
+            name: npmInstall
+            inputs:
+              command: custom
+              verbose: false
+              customCommand: install
+          - task: SonarCloudPrepare@1
+            displayName: prepareAnalisisSonarCloud
+            name: prepareAnalisisSonarCloudmaster
+            condition: or(eq(variables['Build.SourceBranch'], 'refs/heads/master'), eq(variables['Build.SourceBranch'], 'refs/heads/release'))
+            inputs:
+              SonarCloud: SONARCLOUD-XXXX
+              organization: xxxxxxxxx-xx
+              scannerMode: CLI
+              projectKey: 'zleach'
+              projectName: zleach
+              extraProperties: |
+                sonar.projectKey=zleach
+                sonar.projectName=zleach
+                sonar.projectVersion=$(tag)
+                sonar.sources=src
+                sonar.tests=src
+                sonar.sourceEncoding=UTF-8
+                sonar.exclusions=**/dist/**,**/node_modules/**,**/*.spec.ts,**/src/assets/**,**.d.ts,**/services/**,**/interceptors/**,**/enviroments/**,**/security/**,**/models/**
+                sonar.test.inclusions=**/*.spec.ts
+                sonar.coverage.exclusions=**/dist/**,**/node_modules/**,**/*.spec.ts,**/src/assets/**,**.d.ts,**/services/**,**/interceptors/**,**/enviroments/**,**/security/**,**/models/**
+                sonar.ts.tslintconfigpath=tslint.json
+                sonar.javascript.lcov.reportPaths=coverageReport/lcov.info
+                sonar.branch.name=$(branch)
+              enabled: false
+          - task: SonarCloudAnalyze@1
+            displayName: Run Code Analysis
+            enabled: false
+            continueOnError: true
+          - task: SonarCloudPublish@1
+            displayName: Publish Quality Gate Result
+            enabled: false
+            continueOnError: true
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(System.DefaultWorkingDirectory)/k8s
+              artifactName: k8s
+  - stage: devDeploy
+    displayName: devDeploy
+    condition: >-
+      and(succeeded('compileAndScan'), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+    jobs:
+      - job: buildJobDev
+        displayName: buildJob Dev
+        continueOnError: false
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - bash: |
+              ccommit="$(Build.SourceVersion)"
+              echo "##vso[task.setvariable variable=tag]${ccommit:0:8}"
+            displayName: setvariables
+            name: setvariables
+          - bash: |
+              npm -v
+              node -v
+              ls -la
+            displayName: getVesion
+            name: getVesion
+          - task: NodeTool@0
+            displayName: Install Node.js
+            inputs:
+              versionSpec: 18.16.0          
+          - task: Npm@1
+            displayName: npmInstall
+            name: npmInstall
+            inputs:
+              command: custom
+              verbose: false
+              customCommand: install
+          - task: Npm@1
+            displayName: npmBuild
+            name: npmBuild
+            inputs:
+              command: custom
+              verbose: false
+              customCommand: run compile
+          - bash: |
+              npm -v
+              node -v
+              ls -la
+            displayName: getVesion2
+            name: getVesion2
+          - task: Docker@2
+            displayName: 'Push and Push Image'
+            inputs:
+              command: buildAndPush
+              containerRegistry: $(GCP_REGISTRY_DEV)
+              repository: '$(GCP_PROJECT_DEV)/zleach'
+              tags: $(tag)
+      - deployment: devDeploy
+        displayName: devDeploy
+        dependsOn: buildJobDev
+        environment: development
+        pool:
+          vmImage: $(vmImageName)
+        variables:
+          subdomain: zleach
+          domain: test.com
+          secret: test-com
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: |
+                    curl ifconfig.co
+                  displayName: publicIp
+                  name: publicIp
+                - task: KubectlInstaller@0
+                  displayName: Kubectl installer
+                  inputs: 
+                    kubectlVersion: $(KUBECTL_VERSION)
+                - bash: |
+                    ccommit="$(Build.SourceVersion)"
+                    echo "##vso[task.setvariable variable=tag]${ccommit:0:8}"
+                  displayName: setvariables
+                  name: setvariables
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    source: current
+                    artifact: k8s
+                    path: $(Pipeline.Workspace)
+                - bash: |
+                    sed -i 's/#{PROJECT}/$(GCP_PROJECT_DEV)/g' $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                    sed -i 's/#{TAG}/$(tag)/g' $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                    sed -i 's/#{PORT}/$(PORT)/g' $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                    sed -i 's/#{PROFILE}/$(PROFILE_DEV)/g' $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                    sed -i 's/#{NAMESPACE}/$(NAMESPACE)/g' $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                    sed -i 's/#{SUBDOMAIN}/$(subdomain)/g' $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                    sed -i 's/#{DOMAIN}/$(domain)/g' $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                    sed -i 's/#{SECRET}/$(secret)/g' $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                  displayName: replaceParameters
+                  name: replaceParameters
+                - task: Kubernetes@1
+                  displayName: kubectl apply
+                  inputs:
+                    connectionType: Kubernetes Service Connection
+                    kubernetesServiceEndpoint: $(GCP_GKE_DEV)
+                    command: apply
+                    arguments: -f $(Pipeline.Workspace)/k8s/gke/gke-deployment.yaml
+                    versionOrLocation: version
+                    versionSpec: $(KUBECTL_VERSION)
